@@ -5,7 +5,10 @@ use image::Rgb;
 use imageproc::drawing::draw_hollow_rect_mut;
 use imageproc::rect::Rect;
 use tract_onnx::{
-    prelude::{tract_itertools::Itertools, tvec, Framework, InferenceModelExt, IntoTValue, TValue},
+    prelude::{
+        tract_itertools::Itertools, tvec, Framework, InferenceModelExt, IntoTValue, IntoTensor,
+        TValue, TVec, Tensor,
+    },
     tract_hir::tract_ndarray::Array4,
 };
 
@@ -37,11 +40,29 @@ fn main() -> Result<()> {
 
     // Execute model
     let output = runnable_model.run(tvec![input])?;
-
-    let detections = post_process_output(output.get(0).cloned().unwrap(), threshold)?;
+    let reshaped_output = reshape_output(output)?;
+    dbg!(&reshaped_output);
+    let detections = post_process_output(
+        reshaped_output,
+        threshold,
+        //Some(vec![(10, 13), (16, 30), (33, 23)]),
+        //Some((80, 80)),
+        Some(vec![(116, 90), (156, 198), (373, 326)]),
+        Some((20, 20)),
+    )?;
     let filterd_detection = nms_filter(&detections, max_iou);
+    //let filterd_detection = detections;
     render_detections(input_path, &filterd_detection, output_path)?;
     Ok(())
+}
+
+fn reshape_output(outputs: TVec<TValue>) -> Result<TValue> {
+    let (grid_x, grid_y) = (20_usize, 20_usize);
+    let out_0 = outputs[2].clone().into_tensor(); // 1, 255, 80, 80
+    let reshaped_out = out_0.into_shape(&[1, 3, 85, grid_x, grid_y])?; // 1, 3, 85, 80, 80
+    let transposed_out = reshaped_out.move_axis(2, 4)?; // 1, 3, 80, 80, 85
+    let out = transposed_out.into_shape(&[1, 3 * grid_x * grid_y, 85])?; // 1, X, 85
+    Ok(out.into_tvalue())
 }
 
 fn pre_process_input(path: &str) -> Result<TValue> {
@@ -55,16 +76,36 @@ fn pre_process_input(path: &str) -> Result<TValue> {
     Ok(image)
 }
 
-fn post_process_output(raw_output: TValue, threshold: f32) -> Result<Vec<YoloDetection>> {
+fn post_process_output(
+    raw_output: TValue,
+    threshold: f32,
+    anchors: Option<Vec<(usize, usize)>>,
+    grid_size: Option<(usize, usize)>,
+) -> Result<Vec<YoloDetection>> {
     let output_array = raw_output.to_array_view::<f32>()?;
     let detections = output_array
         .rows()
         .into_iter()
-        .map(|it| -> Result<YoloDetection> {
+        .enumerate()
+        .map(|(idx, it)| -> Result<YoloDetection> {
             let raw_detection = it
                 .as_slice()
                 .ok_or(anyhow!("Could not convert raw detection to slice."))?;
-            YoloDetection::from_raw_detection(raw_detection)
+            if let Some((anchors, (grid_x, grid_y))) = anchors.as_ref().zip(grid_size.as_ref()) {
+                let anchor = idx % anchors.len();
+                let i = (idx / anchors.len()) % grid_x;
+                let j = (idx / anchors.len()) / grid_x;
+                YoloDetection::from_raw_detection_with_anchor(
+                    raw_detection,
+                    anchors[anchor],
+                    i,
+                    j,
+                    640 / grid_x,
+                    anchor == 0,
+                )
+            } else {
+                YoloDetection::from_raw_detection(raw_detection)
+            }
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(detections
@@ -86,9 +127,6 @@ fn iou(a: &YoloDetection, b: &YoloDetection) -> f32 {
 
     intersection / (area_a + area_b - intersection)
 }
-
-// 1
-//    2, 3, 4
 
 fn nms_filter(detections: &[YoloDetection], max_iou: f32) -> Vec<YoloDetection> {
     let ordered_detections = detections
@@ -127,6 +165,49 @@ impl YoloDetection {
         self.width * self.height
     }
 
+    fn grid_sensitivity_adjustment_pos(x: f32) -> f32 {
+        let alpha = 2.0;
+        x * alpha + (1.0 - alpha) * 0.5
+    }
+
+    fn grid_sensitivity_adjustment_size(x: f32, anchor_x: usize) -> f32 {
+        (x * x * 4.0) * anchor_x as f32
+    }
+
+    fn from_raw_detection_with_anchor(
+        raw: &[f32],
+        anchor: (usize, usize),
+        i: usize,
+        j: usize,
+        stride: usize,
+        should_debug: bool,
+    ) -> Result<Self> {
+        let ([cx, cy, w, h, box_confidence], confidence) = raw.split_at(5) else {
+            bail!("Expected raw detection to have 85 elements")
+        };
+        let (best_class, _best_confidence) = confidence
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(Ordering::Equal))
+            .unwrap();
+
+        let adjusted_cx = (Self::grid_sensitivity_adjustment_pos(*cx) + i as f32) * stride as f32;
+        let adjusted_cy = (Self::grid_sensitivity_adjustment_pos(*cy) + j as f32) * stride as f32;
+        let adjusted_w = Self::grid_sensitivity_adjustment_size(*w, anchor.0);
+        let adjusted_h = Self::grid_sensitivity_adjustment_size(*h, anchor.1);
+        if should_debug {
+            println!("[{i}, {j}]({cx}, {cy}, {w}, {h}) ax {adjusted_cx}, ay {adjusted_cy}, aw {adjusted_w}, ah {adjusted_h}.");
+        }
+        Ok(Self {
+            x: (adjusted_cx - adjusted_w / 2.0) / 640.0,
+            y: (adjusted_cy - adjusted_h / 2.0) / 640.0,
+            width: adjusted_w / 640.0,
+            height: adjusted_h / 640.0,
+            class_index: best_class,
+            confidence: *box_confidence,
+        })
+    }
+
     // Raw detection is: [x, y, w, h, class1_prob, ..., class80_prob]
     fn from_raw_detection(raw: &[f32]) -> Result<Self> {
         let ([cx, cy, w, h, box_confidence], confidence) = raw.split_at(5) else {
@@ -158,6 +239,10 @@ pub fn render_detections(
     for detection in detections.iter() {
         dbg!(detection.class_index);
         dbg!(detection.confidence);
+        dbg!(detection.x);
+        dbg!(detection.y);
+        dbg!(detection.width);
+        dbg!(detection.height);
         let x = (detection.x) * image.width() as f32;
         let y = (detection.y) * image.height() as f32;
         let width = (detection.width) * image.width() as f32;
